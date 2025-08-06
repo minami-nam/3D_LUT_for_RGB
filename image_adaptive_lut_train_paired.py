@@ -6,11 +6,15 @@ import itertools
 import time
 import datetime
 import sys
+from pytorch_msssim import ssim
 
 from multiprocessing import freeze_support
 
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
+
+
+
 
 from models import *
 from datasets import *
@@ -25,7 +29,7 @@ torch.autograd.set_detect_anomaly(True)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epoch", type=int, default=0)
-    parser.add_argument("--n_epochs", type=int, default=100)
+    parser.add_argument("--n_epochs", type=int, default=200)
     parser.add_argument("--dataset_name", type=str, default="fiveK")
     parser.add_argument("--input_color_space", type=str, default="sRGB")
     parser.add_argument("--batch_size", type=int, default=1)
@@ -45,7 +49,6 @@ def main():
     Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
 
     criterion = nn.MSELoss().to(device)
-
     # Initialize models
     LUT0 = Generator3DLUT_identity().to(device)
     LUT1 = Generator3DLUT_zero().to(device)
@@ -88,9 +91,9 @@ def main():
     # Data loaders
     Dataset = ImageDataset_sRGB if opt.input_color_space=='sRGB' else ImageDataset_XYZ
     train_loader = DataLoader(Dataset(f"data/{opt.dataset_name}", mode="train"),
-                              batch_size=1, shuffle=True, num_workers=opt.n_cpu)
+                              batch_size=1, shuffle=True, num_workers=4)
     test_loader  = DataLoader(Dataset(f"data/{opt.dataset_name}", mode="test"),
-                              batch_size=1, shuffle=False, num_workers=0)
+                              batch_size=1, shuffle=False, num_workers=4)
 
     def generator_train(img): 
         with torch.no_grad():
@@ -103,11 +106,43 @@ def main():
         return combine, wnorm
 
     def generator_eval(img):
-        pred = classifier(img).squeeze()
-        lut = pred[0]*LUT0.LUT + pred[1]*LUT1.LUT + pred[2]*LUT2.LUT
-        wnorm = pred.pow(2).mean()
-        out = trilinear_.apply(lut, img)
-        return out, wnorm
+        with torch.no_grad():
+            # 예측된 weight: pred.shape == [B, 3] 또는 [3]
+            pred = classifier(img).squeeze()
+
+            # 배치 없는 경우 → 배치 1로 reshape
+            if pred.ndim == 1 and pred.shape[0] == 3:
+                pred = pred.unsqueeze(0)   # shape → [1, 3]
+
+            B = pred.shape[0]  # 배치 크기
+
+            # LUTs: [3, 33, 33, 33] × 3 → [3, 3, 33, 33, 33]
+            LUTs = torch.stack([
+                LUT0.LUT,
+                LUT1.LUT,
+                LUT2.LUT
+            ], dim=0).to(pred.device)  # [3, 3, 33, 33, 33]
+            # pred: [B, 3] → [B, 3, 1, 1, 1, 1]
+            weights = pred.view(B, 3, 1, 1, 1, 1)
+            # LUTs: [3, 3, D, D, D] → [1, 3, 3, D, D, D] → broadcast to [B, 3, 3, D, D, D]
+            LUTs = LUTs.unsqueeze(0)  # shape [1, 3, 3, D, D, D]
+            LUTs = LUTs.expand(B, -1, -1, -1, -1, -1)
+            # LUT 가중합 계산: weighted sum over LUT axis (dim=1)
+            # → 결과: [B, 3, 33, 33, 33]
+            final_luts = (weights * LUTs).sum(dim=1)
+            # wnorm 계산: 평균 제곱합 (스칼라)
+            wnorm = pred.pow(2).mean()
+            outputs = []
+
+            # trilinear_.apply()가 batch를 지원하지 않는 경우: 하나씩 처리
+            for i in range(B):
+                lut = final_luts[i]  # [3, 33, 33, 33]
+                input_img = img[i:i+1]  # [1, 3, H, W]
+                out = trilinear_.apply(lut.unsqueeze(0), input_img)
+                outputs.append(out)
+
+            # 결과 병합
+            return torch.cat(outputs, dim=0), wnorm
 
     def calculate_psnr():
         classifier.eval()
@@ -128,43 +163,52 @@ def main():
 
     max_psnr, max_epoch = 0.0, start_epoch
     prev_time = time.time()
+    model_rgbnir = RGBNIRtoRGB().to(device)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_G, mode='min', factor=0.5, patience=5)
 
+    
     for epoch in range(start_epoch, opt.n_epochs):
         classifier.train()
-        model_rgbnir = RGBNIRtoRGB().to(device)
+        mse_avg, psnr_acc = 0, 0
         for i, batch in enumerate(train_loader):
             rgb = batch['A_input'].to(device)
             nir = batch['A_NIR'].to(device)
             real_A = model_rgbnir(rgb,nir).type(Tensor)
             real_B = batch['A_target'].to(device).type(Tensor)
-
             optimizer_G.zero_grad()
             fake_B, wnorm = generator_train(real_A)
             mse = criterion(fake_B, real_B)
-            tv = sum(TV3(lut.LUT)[0] for lut in [LUT0,LUT1,LUT2])
-            mn = sum(TV3(lut.LUT)[1] for lut in [LUT0,LUT1,LUT2])
-            if torch.isnan(fake_B).any():
-                print("모델 출력에 NaN 있음!")
-            if torch.isnan(real_B).any():
-                print("타깃(real_B)에 NaN 있음!")
+            tv = sum(TV3(lut)[0] for lut in [LUT0.LUT, LUT1.LUT, LUT2.LUT])
+            mn = sum(TV3(lut)[1] for lut in [LUT0.LUT, LUT1.LUT, LUT2.LUT])
+
             loss = mse + opt.lambda_smooth*(wnorm+tv) + opt.lambda_monotonicity*mn
-            if torch.isnan(loss):
-                print("Loss가 NaN! backward 호출 전 중단")
-                return
+            scheduler.step(loss.item())
             loss.backward()
             optimizer_G.step()
-
+            psnr_acc += 10 * math.log10(1 / mse.item())
+            mse_avg += mse.item()
+                           
+            batches_done = epoch*len(train_loader) + i
+            batches_left = opt.n_epochs*len(train_loader) - batches_done
+            time_left = datetime.timedelta(seconds=batches_left*(time.time()-prev_time))
+            prev_time = time.time()
+            sys.stdout.write(
+                f"\r[Epoch {epoch}/{opt.n_epochs}] [Batch {i}/{len(train_loader)}] "
+                f"[psnr: {psnr_acc/(i+1):.6f}, tv: {tv:.6f}, "
+                f"wnorm: {wnorm:.6f}, mn: {mn:.6f}] ETA: {time_left}"
+            )
         avg_psnr = calculate_psnr()
-        if avg_psnr>max_psnr:
+        if avg_psnr > max_psnr: 
             max_psnr, max_epoch = avg_psnr, epoch
+        sys.stdout.write(f" [PSNR: {avg_psnr:.6f}] [max PSNR: {max_psnr:.6f}, epoch: {max_epoch}]\n")
 
-        if epoch % opt.checkpoint_interval == 0:
-            LUTs = {str(i):lut.state_dict() for i,lut in enumerate([LUT0,LUT1,LUT2])}
-            torch.save(LUTs, f"saved_models/{opt.output_dir}/LUTs_{epoch}.pth")
-            torch.save(classifier.state_dict(), f"saved_models/{opt.output_dir}/classifier_{epoch}.pth")
-            torch.save(optimizer_G.state_dict(), f"saved_models/{opt.output_dir}/optimizer_{epoch}.pth")
-            with open(f"saved_models/{opt.output_dir}/result.txt","a") as f:
-                f.write(f"[PSNR:{avg_psnr:.6f}] [max PSNR:{max_psnr:.6f}, epoch:{max_epoch}]\n")
+    if epoch % opt.checkpoint_interval == 0:
+        LUTs = {str(i):lut.state_dict() for i,lut in enumerate([LUT0,LUT1,LUT2])}
+        torch.save(LUTs, f"saved_models/{opt.output_dir}/LUTs_{epoch}.pth")
+        torch.save(classifier.state_dict(), f"saved_models/{opt.output_dir}/classifier_{epoch}.pth")
+        torch.save(optimizer_G.state_dict(), f"saved_models/{opt.output_dir}/optimizer_{epoch}.pth")
+        with open(f"saved_models/{opt.output_dir}/result.txt","a") as f:
+            f.write(f"[PSNR:{avg_psnr:.6f}] [max PSNR:{max_psnr:.6f}, epoch:{max_epoch}]\n")
 
 if __name__ == "__main__":
     freeze_support()

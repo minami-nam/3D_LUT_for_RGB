@@ -53,8 +53,8 @@ class RGBNIRtoRGB(nn.Module):
         self.final = nn.Conv2d(8, 3, kernel_size=1)
         
     def forward(self, RGB, NIR):
-        x = torch.cat([RGB, NIR], dim=1)
-        x = F.relu(self.conv(x))
+        x = torch.cat([RGB.contiguous(), NIR.contiguous()], dim=1)
+        x = F.relu(self.conv(x), inplace=True)
         return self.final(x)
 
 
@@ -255,6 +255,17 @@ class Generator3DLUT_zero(nn.Module):
 
     def forward(self, x):
         return TrilinearInterpolation.apply(self.LUT, x)
+    
+    
+class Generator3DLUT_random(nn.Module):
+    def __init__(self, dim=33):
+        super(Generator3DLUT_random, self).__init__()
+        LUT = torch.rand(3,dim,dim,dim) * 0.01
+        self.LUT = nn.Parameter(LUT)
+        
+    def forward(self, x):
+        return TrilinearInterpolation.apply(self.LUT, x)
+    
 
 
 class TrilinearInterpolation(Function):
@@ -263,29 +274,15 @@ class TrilinearInterpolation(Function):
         # contiguity 보장
         x_cont = x.contiguous()
         LUT_cont = LUT.contiguous()
-        
-        # 3) contiguity 여부 출력 / assert
-        print(f"[DEBUG] x_cont.is_contiguous={x_cont.is_contiguous()}, strides={x_cont.stride()}")
-        print(f"[DEBUG] LUT_cont.is_contiguous={LUT_cont.is_contiguous()}, strides={LUT_cont.stride()}")
-        assert x_cont.is_contiguous(),   "x_cont 가 contiguous 가 아닙니다!"
-        assert LUT_cont.is_contiguous(), "LUT_cont 가 contiguous 가 아닙니다!"
-        
         output = x_cont.new_zeros(x_cont.size())
         
-        # 3) 연속성(assert) 점검
-        assert x_cont.is_contiguous(), \
-            f"x_cont not contiguous! strides={x_cont.stride()}"
-        assert LUT_cont.is_contiguous(), \
-            f"LUT_cont not contiguous! strides={LUT_cont.stride()}"
-
 
         # 파라미터
         B, C, H, W = x_cont.shape
+        x_cont = x_cont.clamp(0.0, 1.0 - 1e-6)
         dim     = LUT.size(-1)
         shift   = dim ** 3
-        binsize = 1.0001 / (dim - 1)
-
-        torch.cuda.synchronize()
+        binsize = 1.0 / (dim - 1) # 1.0001
 
         # CUDA/CPU 모두 같은 바인딩 함수명을 쓰되, 
         # dispatch는 텐서가 GPU 상에 있느냐로 구분합니다.
@@ -293,8 +290,6 @@ class TrilinearInterpolation(Function):
             LUT_cont, x_cont, output,
             dim, shift, binsize, W, H, B
         )
-
-
         # backward 에 필요하니 저장
         ctx.save_for_backward(x_cont, LUT_cont)
         ctx.dim     = dim
@@ -303,8 +298,6 @@ class TrilinearInterpolation(Function):
         ctx.W       = W
         ctx.H       = H
         ctx.B       = B
-
-
         return output
 
     @staticmethod
@@ -312,18 +305,12 @@ class TrilinearInterpolation(Function):
         x, LUT = ctx.saved_tensors
         dim, shift, binsize = ctx.dim, ctx.shift, ctx.binsize
         W, H, B             = ctx.W, ctx.H, ctx.B
-  
-
         # LUT gradient 만 계산
         grad_LUT = torch.zeros_like(LUT)
-
-
         trilinear_ext.backward(
             x, grad_output, grad_LUT,
             dim, shift, binsize, W, H, B
         )
-
-
         # (grad_wrt_LUT, grad_wrt_x) — x 에 대한 grad 는 None
         return grad_LUT, None
 
@@ -349,6 +336,11 @@ class TV_3D(nn.Module):
     def forward(self, lut_tensor):
         # Accept raw LUT tensor rather than module
         LUT = lut_tensor if not hasattr(lut_tensor, 'LUT') else lut_tensor.LUT
+        #    weight_r.shape[0] == C (e.g. 3)
+        if LUT.shape[0] != self.weight_r.shape[0]:
+            # assume it’s [D, C, H, W] → move C→0
+            LUT = LUT.permute(1, 0, 2, 3).contiguous()
+
         dif_r = LUT[:,:,:,:-1] - LUT[:,:,:,1:]
         dif_g = LUT[:,:,:-1,:] - LUT[:,:,1:,:]
         dif_b = LUT[:,:-1,:,:] - LUT[:,1:,:,:]
