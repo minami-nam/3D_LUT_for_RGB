@@ -55,10 +55,10 @@ class ImageDataset_sRGB(Dataset):
             self.input_files  = build_paths(self.root, "input/JPG",   names_test)
             self.target_files = build_paths(self.root, "Target/JPG", names_test)
 
-        # transforms
+        # transforms / to_tensor
         self.to_tensor = TF.to_tensor
-        self.transforms = transforms.RandomCrop
 
+        
     def __len__(self):
         return len(self.input_files)
     
@@ -66,14 +66,30 @@ class ImageDataset_sRGB(Dataset):
     def __getitem__(self, idx):
         inp_path = self.input_files[idx]
         tgt_path = self.target_files[idx]
-
-        img_in = Image.open(inp_path).convert("RGB")  # 
+        
+        img_in = Image.open(inp_path).convert("RGB")   
         img_tgt = Image.open(tgt_path).convert("RGB")
         t_in = self.to_tensor(img_in)
         t_tgt = self.to_tensor(img_tgt)
         
         if self.mode == "train":
-            t_nir = self.to_tensor(Image.open(self.input_NIR_files[idx]).convert("L") )
+            t_nir = self.to_tensor(Image.open(self.input_NIR_files[idx]).convert("L") ) # Greyscale로 변환
+            _, H, W = t_in.shape
+            crop_size = int(min(H, W) * 0.8)  # 80% random crop
+            i, j, h, w = transforms.RandomCrop.get_params(t_in, (crop_size, crop_size))
+
+            t_in = TF.crop(t_in, i, j, h, w)
+            t_nir = TF.crop(t_nir, i, j, h, w)
+            t_tgt = TF.crop(t_tgt, i, j, h, w)
+
+            # Horizontal flip
+            if random.random() > 0.5:
+                t_in = TF.hflip(t_in)
+                t_nir = TF.hflip(t_nir)
+                t_tgt = TF.hflip(t_tgt)
+
+    # 밝기 조절 (선택)
+            t_in = TF.adjust_brightness(t_in, random.uniform(0.8, 1.2))
         else:
             t_nir = torch.zeros_like(t_in[:1]) 
             
