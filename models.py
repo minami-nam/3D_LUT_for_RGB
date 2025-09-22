@@ -3,16 +3,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as transforms
-from torch.autograd import Function, Variable
+from torch.autograd import Function
+import tifffile as tiff
 import numpy as np
-import math
 import datasets as ds
-# C++/CUDA 확장 모듈을 trilinear_ext로 임포트
-import trilinear_c._ext as trilinear_ext
+import kornia.color as K
+import trilinear_c__ext as trilinear_ext
 
-import os
+# ---------------------- normalization2D 관련 ---------------------- 
+
+def get_norm2d(num_features: int, norm_type: str = "instance"):
+
+    if norm_type == "batch":
+        return nn.BatchNorm2d(num_features)  # running stats ON by default
+    elif norm_type == "instance":
+        return nn.InstanceNorm2d(num_features, affine=True, track_running_stats=False)
+    elif norm_type == "none":
+        return nn.Identity()
+    else:
+        raise ValueError(f"Unsupported norm_type: {norm_type}")
+
+
+# ---------------------- Debugging 및 Parameter ---------------------- 
 
 torch.autograd.set_detect_anomaly(True)
+
+
+# ----------------------  Weight 관련 ---------------------- 
 
 def weights_init_normal_classifier(m):
     classname = m.__class__.__name__
@@ -23,225 +40,65 @@ def weights_init_normal_classifier(m):
         torch.nn.init.constant_(m.bias.data, 0.0)
 
 
-class resnet18_224(nn.Module):
-    def __init__(self, out_dim=5, aug_test=False):
-        super(resnet18_224, self).__init__()
-        self.aug_test = aug_test
-        net = models.resnet18(pretrained=True)
-        net.fc = nn.Linear(512, out_dim)
-        self.upsample = nn.Upsample(size=(224,224), mode='bilinear')
-        self.model = net
+# ---------------------- Classifier 및 Layer 관련 ---------------------- 
 
-    def forward(self, x):
-        x = self.upsample(x)
-        if self.aug_test:
-            x = torch.cat((x, torch.flip(x, [3])), 0)
-        return self.model(x)
-
-
-##############################
-#           DPE
-##############################
-
-class RGBNIRtoRGB(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # Kernel_size를 1로 하면, 3x3 배열에서 손실 없이 3x3 배열로 복제가 가능하고, 대신 채널만 절반으로 줄어드는 효과를 볼 수 있음.
-        # 일단 선형 연산인 conv를 시도 후, 이를 비선형 활성화(ReLU)를 통해 복잡한 함수를 학습할 수 있게 도움.
-        
-        self.conv = nn.Conv2d(4, 8, kernel_size=1, padding=0)
-        self.final = nn.Conv2d(8, 3, kernel_size=1)
-        
-    def forward(self, RGB, NIR):
-        x = torch.cat([RGB.contiguous(), NIR.contiguous()], dim=1)
-        x = F.relu(self.conv(x), inplace=True)
-        return self.final(x)
-
-
-class UNetDown(nn.Module):
-    def __init__(self, in_size, out_size, normalize=True, dropout=0.0):
-        super(UNetDown, self).__init__()
-        layers = [nn.Conv2d(in_size, out_size, 5, 2, 2),
-                  nn.SELU(inplace=True)]
-        if normalize:
-            layers.append(nn.InstanceNorm2d(out_size, affine=True))
-        if dropout:
-            layers.append(nn.Dropout(dropout))
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.model(x)
-
-
-class UNetUp(nn.Module):
-    def __init__(self, in_size, out_size, normalize=True, dropout=0.0):
-        super(UNetUp, self).__init__()
-        layers = [
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-            nn.Conv2d(in_size, out_size, 3, padding=1),
-            nn.SELU(inplace=True),
-        ]
-        if normalize:
-            layers.append(nn.InstanceNorm2d(out_size, affine=True))
-        if dropout:
-            layers.append(nn.Dropout(dropout))
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, x, skip_input):
-        x = self.model(x)
-        return torch.cat((x, skip_input), 1)
-
-
-class GeneratorUNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=3):
-        super(GeneratorUNet, self).__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels,16,in_channels,padding=1),
-            nn.SELU(inplace=True),
-            nn.InstanceNorm2d(16, affine=True),
-        )
-        self.down1 = UNetDown(16,32)
-        self.down2 = UNetDown(32,64)
-        self.down3 = UNetDown(64,128)
-        self.down4 = UNetDown(128,128)
-        self.down5 = UNetDown(128,128)
-        self.down6 = UNetDown(128,128)
-        self.down7 = nn.Sequential(
-            nn.Conv2d(128,128,3,padding=1),
-            nn.SELU(inplace=True),
-            nn.Conv2d(128,128,1)
-        )
-        self.upsample = nn.Upsample(scale_factor=4, mode='bilinear')
-        self.conv1x1 = nn.Conv2d(256,128,1)
-        self.up1 = UNetUp(128,128)
-        self.up2 = UNetUp(256,128)
-        self.up3 = UNetUp(192,64)
-        self.up4 = UNetUp(96,32)
-        self.final = nn.Sequential(
-            nn.Conv2d(48,16,3,padding=1),
-            nn.SELU(inplace=True),
-            nn.Conv2d(16,out_channels,3,padding=1),
-        )
-
-    def forward(self, x):
-        x1 = self.conv1(x)
-        d1 = self.down1(x1)
-        d2 = self.down2(d1)
-        d3 = self.down3(d2)
-        d4 = self.down4(d3)
-        d5 = self.down5(d4)
-        d6 = self.down6(d5)
-        d7 = self.down7(d6)
-        d8 = self.upsample(d7)
-        d9 = self.conv1x1(torch.cat((d4,d8),1))
-        u1 = self.up1(d9, d3)
-        u2 = self.up2(u1, d2)
-        u3 = self.up3(u2, d1)
-        u4 = self.up4(u3, x1)
-        return torch.add(self.final(u4), x)
-
-
-class Discriminator_UNet(nn.Module):
-    def __init__(self, in_channels=3):
-        super(Discriminator_UNet, self).__init__()
-        self.model = nn.Sequential(
-            nn.Conv2d(3,16,3,stride=2,padding=1),
-            nn.LeakyReLU(0.2),
-            nn.InstanceNorm2d(16, affine=True),
-            *discriminator_block(16,32),
-            *discriminator_block(32,64),
-            *discriminator_block(64,128),
-            *discriminator_block(128,128),
-            *discriminator_block(128,128),
-            nn.Conv2d(128,1,4)
-        )
-
-    def forward(self, img_input):
-        return self.model(img_input)
-
-
-def discriminator_block(in_filters, out_filters, normalization=False):
-    layers = [nn.Conv2d(in_filters,out_filters,3,stride=2,padding=1),
+def discriminator_block(in_filters, out_filters, normalization=False, norm_type: str = "instance"):
+    layers = [nn.Conv2d(in_filters, out_filters, 3, stride=2, padding=1),
               nn.LeakyReLU(0.2)]
     if normalization:
-        layers.append(nn.InstanceNorm2d(out_filters, affine=True))
+        layers.append(get_norm2d(out_filters, norm_type))
     return layers
 
 
-class Discriminator(nn.Module):
-    def __init__(self, in_channels=3):
-        super(Discriminator, self).__init__()
-        self.model = nn.Sequential(
-            nn.Upsample(size=(256,256), mode='bilinear'),
-            nn.Conv2d(3,16,3,stride=2,padding=1),
-            nn.LeakyReLU(0.2),
-            nn.InstanceNorm2d(16, affine=True),
-            *discriminator_block(16,32),
-            *discriminator_block(32,64),
-            *discriminator_block(64,128),
-            *discriminator_block(128,128),
-            nn.Conv2d(128,1,8)
-        )
-
-    def forward(self, img_input):
-        return self.model(img_input)
-
-
 class Classifier(nn.Module):
-    def __init__(self, in_channels=3):
+    def __init__(self, in_channels=3, num_LUTS=3, norm_type: str = "instance"):
         super(Classifier, self).__init__()
         self.model = nn.Sequential(
             nn.Upsample(size=(256,256), mode='bilinear'),
-            nn.Conv2d(3,16,3,stride=2,padding=1),
+            nn.Conv2d(in_channels, 16, 3, stride=2, padding=1),
             nn.LeakyReLU(0.2),
-            nn.InstanceNorm2d(16, affine=True),
-            *discriminator_block(16,32, normalization=True),
-            *discriminator_block(32,64, normalization=True),
-            *discriminator_block(64,128, normalization=True),
-            *discriminator_block(128,128),
+            get_norm2d(16, norm_type),
+            *discriminator_block(16,32, normalization=True, norm_type=norm_type),
+            *discriminator_block(32,64, normalization=True, norm_type=norm_type),
+            *discriminator_block(64,128, normalization=True, norm_type=norm_type),
+            *discriminator_block(128,128, norm_type=norm_type),
             nn.Dropout(0.5),
-            nn.Conv2d(128,3,8)
+            nn.Conv2d(128,num_LUTS,8)
         )
 
     def forward(self, img_input):
         return self.model(img_input)
-
-
-class Classifier_unpaired(nn.Module):
-    def __init__(self, in_channels=3):
-        super(Classifier_unpaired, self).__init__()
-        self.model = nn.Sequential(
-            nn.Upsample(size=(256,256), mode='bilinear'),
-            nn.Conv2d(in_channels,16,3,stride=2,padding=1),
-            nn.LeakyReLU(0.2),
-            nn.InstanceNorm2d(16, affine=True),
-            *discriminator_block(16,32),
-            *discriminator_block(32,64),
-            *discriminator_block(64,128),
-            *discriminator_block(128,128),
-            nn.Conv2d(128,3,8)
-        )
-
-    def forward(self, img_input):
-        return self.model(img_input)
-
+    
+# ---------------------- 3D LUT ---------------------- 
 
 class Generator3DLUT_identity(nn.Module):
-    def __init__(self, dim=33):
+    def __init__(self, dim=33, fname_3d="IdentityLUT33.txt", use_file=True):
         super(Generator3DLUT_identity, self).__init__()
-        fname = "IdentityLUT33.txt" if dim==33 else "IdentityLUT64.txt"
-        with open(fname,'r') as file:
-            LUT_lines = file.readlines()
-        LUT = torch.zeros(3,dim,dim,dim)
-        for i in range(dim):
-            for j in range(dim):
-                for k in range(dim):
-                    n = i*dim*dim + j*dim + k
-                    x = LUT_lines[n].split()
-                    LUT[0,i,j,k] = float(x[0])
-                    LUT[1,i,j,k] = float(x[1])
-                    LUT[2,i,j,k] = float(x[2])
-        self.LUT = nn.Parameter(LUT)
+        self.dim = dim
+        if use_file:
+            # 3D identity 파일을 읽어 베이스 3D LUT 생성
+            with open(fname_3d, 'r') as f:
+                lines = f.readlines()
+            LUT3 = torch.zeros(3, dim, dim, dim)
+            idx = 0
+            for i in range(dim):
+                for j in range(dim):
+                    for k in range(dim):
+                        x = lines[idx].split()
+                        LUT3[0, i, j, k] = float(x[0])
+                        LUT3[1, i, j, k] = float(x[1])
+                        LUT3[2, i, j, k] = float(x[2])
+                        idx += 1
+        else:
+            # 파일 없이 수학적으로 identity 3D LUT 생성
+            r = torch.linspace(0, 1, dim)
+            g = torch.linspace(0, 1, dim)
+            b = torch.linspace(0, 1, dim)
+            R, G, B = torch.meshgrid(r, g, b, indexing='ij')
+            LUT3 = torch.stack([R, G, B], dim=0)  # (3,dim,dim,dim)
+
+        self.LUT = nn.Parameter(LUT3)
+
 
     def forward(self, x):
         return TrilinearInterpolation.apply(self.LUT, x)
@@ -256,64 +113,60 @@ class Generator3DLUT_zero(nn.Module):
     def forward(self, x):
         return TrilinearInterpolation.apply(self.LUT, x)
     
-    
-class Generator3DLUT_random(nn.Module):
-    def __init__(self, dim=33):
-        super(Generator3DLUT_random, self).__init__()
-        LUT = torch.rand(3,dim,dim,dim) * 0.01
-        self.LUT = nn.Parameter(LUT)
-        
-    def forward(self, x):
-        return TrilinearInterpolation.apply(self.LUT, x)
-    
-
+# ---------------------- Trilinear Interpolation ---------------------- 
 
 class TrilinearInterpolation(Function):
     @staticmethod
-    def forward(ctx, LUT, x):
-        # contiguity 보장
-        x_cont = x.contiguous()
+    def forward(ctx, LUT, x):  # 3D LUT
+        x_cont   = x.contiguous()
         LUT_cont = LUT.contiguous()
-        output = x_cont.new_zeros(x_cont.size())
-        
 
-        # 파라미터
         B, C, H, W = x_cont.shape
-        x_cont = x_cont.clamp(0.0, 1.0 - 1e-6)
-        dim     = LUT.size(-1)
-        shift   = dim ** 3
-        binsize = 1.0 / (dim - 1) # 1.0001
+        dim     = LUT_cont.size(1)
 
-        # CUDA/CPU 모두 같은 바인딩 함수명을 쓰되, 
-        # dispatch는 텐서가 GPU 상에 있느냐로 구분합니다.
-        trilinear_ext.forward(
-            LUT_cont, x_cont, output,
-            dim, shift, binsize, W, H, B
+        shift   = dim ** 3
+        binsize = 1.0 / (dim - 1)
+
+        # CUDA 바인딩 호출 (qforward)
+        output = trilinear_ext.forward(
+            LUT_cont, x_cont,
+            dim, shift, binsize,
+            W, H, B
         )
-        # backward 에 필요하니 저장
+
+        # backward용 저장
         ctx.save_for_backward(x_cont, LUT_cont)
-        ctx.dim     = dim
-        ctx.shift   = shift
-        ctx.binsize = binsize
-        ctx.W       = W
-        ctx.H       = H
-        ctx.B       = B
+        ctx.dim      = dim
+        ctx.shift    = shift
+        ctx.binsize  = binsize
+        ctx.W        = W
+        ctx.H        = H
+        ctx.B        = B
+
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         x, LUT = ctx.saved_tensors
-        dim, shift, binsize = ctx.dim, ctx.shift, ctx.binsize
-        W, H, B             = ctx.W, ctx.H, ctx.B
-        # LUT gradient 만 계산
-        grad_LUT = torch.zeros_like(LUT)
-        trilinear_ext.backward(
-            x, grad_output, grad_LUT,
-            dim, shift, binsize, W, H, B
+        dim      = ctx.dim
+        shift    = ctx.shift
+        binsize  = ctx.binsize
+        W, H, B= ctx.W, ctx.H, ctx.B
+
+        grad_output = grad_output.contiguous()
+
+        # backward는 LUT에 대한 그래디언트만 계산해 반환합니다: (3, D, D, D, DN)
+        grad_LUT = trilinear_ext.backward(
+            x, grad_output,
+            dim, shift, binsize,
+            W, H, B
         )
-        # (grad_wrt_LUT, grad_wrt_x) — x 에 대한 grad 는 None
+
+        # 입력 x에 대한 grad는 계산하지 않으면 None
         return grad_LUT, None
 
+
+# ----------------------  Total Variation 관련 ---------------------- 
 
 class TV_3D(nn.Module):
     def __init__(self, dim=33):
@@ -351,3 +204,39 @@ class TV_3D(nn.Module):
               torch.mean(self.relu(dif_g)) +
               torch.mean(self.relu(dif_b)))
         return tv, mn
+    
+# ------------------- SSIM ------------------------------
+class SSIM(nn.Module):
+    """Layer to compute the SSIM loss between a pair of images
+    """
+    def __init__(self):
+        super(SSIM, self).__init__()
+        self.mu_x_pool   = nn.AvgPool2d(3, 1)
+        self.mu_y_pool   = nn.AvgPool2d(3, 1)
+        self.sig_x_pool  = nn.AvgPool2d(3, 1)
+        self.sig_y_pool  = nn.AvgPool2d(3, 1)
+        self.sig_xy_pool = nn.AvgPool2d(3, 1)
+
+        # 입력 경계의 반사를 사용하여 상/하/좌/우에 입력 텐서를 추가로 채웁니다.
+        self.refl = nn.ReflectionPad2d(1)
+
+        self.C1 = 0.01 ** 2
+        self.C2 = 0.03 ** 2
+
+    def forward(self, x, y):
+        # shape : (xh, xw) -> (xh + 2, xw + 2)
+        x = self.refl(x) 
+        # shape : (yh, yw) -> (yh + 2, yw + 2)
+        y = self.refl(y)
+
+        mu_x = self.mu_x_pool(x)
+        mu_y = self.mu_y_pool(y)
+
+        sigma_x  = self.sig_x_pool(x ** 2) - mu_x ** 2
+        sigma_y  = self.sig_y_pool(y ** 2) - mu_y ** 2
+        sigma_xy = self.sig_xy_pool(x * y) - mu_x * mu_y
+
+        SSIM_n = (2 * mu_x * mu_y + self.C1) * (2 * sigma_xy + self.C2)
+        SSIM_d = (mu_x ** 2 + mu_y ** 2 + self.C1) * (sigma_x + sigma_y + self.C2)
+
+        return torch.clamp((1 - SSIM_n / SSIM_d), 0, 1)

@@ -1,12 +1,12 @@
-#ifndef TRILINEAR_H
-#define TRILINEAR_H
+#ifndef TRILINEAR_H_
+#define TRILINEAR_H_
 
-#include<torch/extension.h>
+#include <torch/extension.h>
 
-int trilinear_forward(torch::Tensor lut, torch::Tensor image, torch::Tensor output,
-                      int lut_dim, int shift, float binsize, int width, int height, int batch);
+torch::Tensor trilinear_forward(torch::Tensor lut, torch::Tensor image,
+                                int dim, int shift, float binsize, int W, int H, int B);
 
-int trilinear_backward(torch::Tensor image, torch::Tensor image_grad, torch::Tensor lut_grad,
-                       int lut_dim, int shift, float binsize, int width, int height, int batch);
+torch::Tensor trilinear_backward(torch::Tensor image, torch::Tensor grad_output,
+                                 int dim, int shift, float binsize, int W, int H, int B);
 
 #endif
