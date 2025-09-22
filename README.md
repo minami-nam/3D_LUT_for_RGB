@@ -1,4 +1,4 @@
- # **(Image - Adaptive) 3D-LUT-for-RGB-NIR**
+ # **(Image - Adaptive) 3D-LUT-for-RGB-(NIR)**
 
  
 ## About this program
@@ -8,7 +8,7 @@ It's my first program using python.
 
 My Lab wanted to make program that has 2 inputs, RGB (PNG) file and NIR(High-light) file each and prints some results using 3D LUT method.
 
-Caution : now I modified only about paired training. so unpaired one may have some problems to run directly.
+Caution : now I modified only about paired training. so if you run unpaired one may have some problems to run directly.
 
 
 ## Usage
@@ -38,7 +38,6 @@ and to train the model, put input files in data/fiveK/input, Highlighted NIR fil
 
 ```
 cd your/dir/Image-Adaptive-3DLUT-master
-python final.py # if you need to make dataset files
 
 python setup.py install
 
