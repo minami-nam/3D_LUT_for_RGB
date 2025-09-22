@@ -6,7 +6,7 @@ First, It's based on HuiZeng/Image-Adaptive-3DLUT, so if you want to make on you
 
 It's my first program using python. 
 
----My Lab wanted to make program that has 2 inputs, RGB (PNG) file and NIR(High-light) file each and prints some results using 3D LUT method.---
+~My Lab wanted to make program that has 2 inputs, RGB (PNG) file and NIR(High-light) file each and prints some results using 3D LUT method.~
 
 Caution : now I modified only about paired training. so if you run unpaired one may have some problems to run directly.
 
