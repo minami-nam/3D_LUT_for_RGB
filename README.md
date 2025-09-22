@@ -12,7 +12,7 @@ Caution : now I modified only about paired training. so if you run unpaired one 
 
 
 ## Usage
-
+### I strongly recommend you to use .ipynb file to run and debug this model well. this section needs to update.
 #### Requirements : 
 ```
 Python 3.10.x, 
